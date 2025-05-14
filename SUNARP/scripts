@@ -1,1 +1,187 @@
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from PIL import Image, ImageEnhance, ImageFilter
+import pytesseract
+import time
+import cv2
+import numpy as np
+
+# Configurar ruta de Tesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\olssa_fbazan\AppData\Local\Programs\Tesseract-OCR\tesseract"
+
+# Rutas de archivos
+input_file = r"C:\Users\olssa_fbazan\Desktop\RPA\input_dnis.xlsx"
+output_file = r"C:\Users\olssa_fbazan\Desktop\RPA\output_resultados.xlsx"
+
+# Leer el Excel
+df = pd.read_excel(input_file, dtype={"DNI": str, "Fecha Emision": str})
+
+# Inicializar navegador
+driver = webdriver.Chrome()
+driver.maximize_window()
+wait = WebDriverWait(driver, 10)
+
+# Función para resolver el CAPTCHA
+def resolver_captcha():
+    intentos = 0
+    captcha_correcto = False
+
+    while not captcha_correcto:
+        intentos += 1
+        print(f"Intento #{intentos} - Capturando CAPTCHA...")
+
+        captcha_element = wait.until(EC.presence_of_element_located((
+            By.XPATH,
+            '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[5]/div/img'
+        )))
+        captcha_element.screenshot("captcha.png")
+
+        # Procesamiento OpenCV
+        img = cv2.imread("captcha.png")
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, binary = cv2.threshold(blurred, 180, 255, cv2.THRESH_BINARY_INV)
+        edges = cv2.Canny(binary, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 60, minLineLength=20, maxLineGap=10)
+
+        mask = np.ones_like(binary) * 255
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                if 20 < angle < 160:
+                    cv2.line(mask, (x1, y1), (x2, y2), 0, 2)
+        final = cv2.bitwise_and(binary, mask)
+        cv2.imwrite("captcha_cleaned.png", final)
+
+        # OCR con Tesseract
+        pil_img = Image.open("captcha_cleaned.png")
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(2).filter(ImageFilter.SHARPEN)
+        captcha_text = pytesseract.image_to_string(
+            pil_img,
+            config='--psm 8 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        ).strip().replace(" ", "").replace("\n", "")
+        print("CAPTCHA leído:", captcha_text)
+
+        if len(captcha_text) != 6 or not captcha_text.isalnum():
+            print(f"Texto CAPTCHA no válido ({captcha_text}), reintentando...")
+            wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[5]/div/nz-form-control/div/div/a/span'
+            ))).click()
+            time.sleep(2)
+            continue
+
+        # Ingresar CAPTCHA
+        campo_captcha = wait.until(EC.element_to_be_clickable((
+            By.XPATH,
+            '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[5]/div/nz-form-control/div/div/nz-input-group/input'
+        )))
+        campo_captcha.clear()
+        campo_captcha.send_keys(captcha_text)
+
+        # Click en Aceptar
+        wait.until(EC.element_to_be_clickable((
+            By.XPATH,
+            '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[6]/nz-form-control/div/div/div/button'
+        ))).click()
+        time.sleep(3)
+
+        # Verificar si hubo error
+        if driver.find_elements(By.XPATH, '/html/body/div[2]/div/div[6]/button[1]'):
+            print("CAPTCHA incorrecto. Cerrando alerta...")
+            wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                '/html/body/div[2]/div/div[6]/button[1]'
+            ))).click()
+            time.sleep(1)
+            wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[5]/div/nz-form-control/div/div/a/span'
+            ))).click()
+            time.sleep(2)
+        else:
+            print("CAPTCHA aceptado correctamente.")
+            captcha_correcto = True
+
+    return captcha_text
+
+
+# Lista para guardar resultados
+resultados = []
+
+# Procesar cada registro
+for index, row in df.iterrows():
+    dni = row["DNI"].zfill(8)
+    fecha_emision = str(row["Fecha Emision"]).zfill(8)
+    print(f"\n--- Procesando DNI {dni} ---")
+
+    try:
+        driver.get("https://www2.sunarp.gob.pe/consulta-propiedad/inicio")
+
+        # Seleccionar tipo de documento
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+            '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[2]/nz-form-control/div/div/nz-input-group/nz-select/nz-select-arrow'
+        ))).click()
+
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+            '//*[@id="cdk-overlay-0"]/nz-option-container/div/cdk-virtual-scroll-viewport/div[1]/nz-option-item[1]/div'
+        ))).click()
+
+        # Ingresar DNI y fecha
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+            '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[3]/nz-form-control/div/div/nz-input-group/input'
+        ))).send_keys(dni)
+
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+            '/html/body/app-root/nz-content/div/app-inicio/app-login/nz-layout/nz-content/div[2]/form/nz-form-item[4]/nz-form-control/div/div/nz-input-group/input'
+        ))).send_keys(fecha_emision)
+
+        captcha_text = resolver_captcha()
+
+        # Esperar a que aparezca la tabla
+        tabla = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "nz-table-inner-default .ant-table-content table")))
+
+        # Extraer las filas de la tabla
+        filas = tabla.find_elements(By.CSS_SELECTOR, "tbody.ant-table-tbody tr")
+        for fila in filas:
+            columnas = fila.find_elements(By.CSS_SELECTOR, "td")
+            if len(columnas) >= 2:
+                nro = columnas[0].text.strip()
+                NroDocumento = columnas[1].text.strip()
+                Titular = columnas[2].text.strip()
+                Partida = columnas[3].text.strip()
+                Zona = columnas[4].text.strip()
+                Oficina = columnas[5].text.strip()
+                #detalle_items = columnas[1].find_elements(By.TAG_NAME, "li")
+                #detalle_texto = "\n".join([item.text.strip() for item in detalle_items])
+
+                resultados.append({
+                    #"DNI": dni,
+                    "Nro": nro,
+                    "NroDocumento":NroDocumento,
+                    "Titular": Titular,
+                    "Partida":Partida,
+                    "Zona": Zona,
+                    "Oficina":Oficina,
+                  
+                  
+                })
+
+    except Exception as e:
+        print(f"Error procesando DNI {dni}: {e}")
+        resultados.append({
+            "DNI": dni,
+            "Nro": "ERROR",
+            "Detalle": str(e)
+        })
+
+# Guardar resultados
+df_resultados = pd.DataFrame(resultados)
+df_resultados.to_excel(output_file, index=False)
+driver.quit()
+print(f"\nProceso finalizado. Resultados guardados en:\n{output_file}")
 
